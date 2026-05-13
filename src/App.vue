@@ -1,89 +1,51 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { save, open } from "@tauri-apps/plugin-dialog";
-
-interface DiskInfo {
-  DeviceID: string;
-  Caption: string;
-  Size: number;
-  MediaType: string | null;
-  Partitions: number;
-}
-
-interface ProgressEvent {
-  bytes_processed: number;
-  total_bytes: number;
-  speed_bytes_per_sec: number;
-  eta_seconds: number;
-  percent: number;
-}
-
-type OperationMode = "clone" | "restore" | "verify";
+import { ref, computed, onMounted, onUnmounted, watch } from "vue";
+import TabBar from "./components/TabBar.vue";
+import ClonePanel from "./components/ClonePanel.vue";
+import RestorePanel from "./components/RestorePanel.vue";
+import DiskToDiskPanel from "./components/DiskToDiskPanel.vue";
+import VerifyPanel from "./components/VerifyPanel.vue";
+import ProgressDisplay from "./components/ProgressDisplay.vue";
+import { useProgress } from "@/composables/useProgress";
+import { listDisks, cancelOperation, isElevated, restartAsAdmin } from "@/composables/useCloneApi";
+import type { DiskInfo, OperationMode } from "@/types/disk";
 
 const mode = ref<OperationMode>("clone");
 const disks = ref<DiskInfo[]>([]);
 const loadingDisks = ref(false);
 const diskError = ref("");
-
-const selectedSourceDisk = ref("");
-const selectedTargetDisk = ref("");
-const outputImagePath = ref("");
-const inputImagePath = ref("");
+const isAdmin = ref(true);
+const showAdminWarning = ref(false);
 
 const isRunning = ref(false);
-const progress = ref<ProgressEvent | null>(null);
 const operationError = ref("");
 const operationSuccess = ref("");
-const verify = ref(true);
 const hashResult = ref("");
 
-const formattedSize = (bytes: number): string => {
-  if (bytes === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`;
-};
+const clonePanelRef = ref<InstanceType<typeof ClonePanel>>();
+const restorePanelRef = ref<InstanceType<typeof RestorePanel>>();
+const diskToDiskPanelRef = ref<InstanceType<typeof DiskToDiskPanel>>();
+const verifyPanelRef = ref<InstanceType<typeof VerifyPanel>>();
 
-const formatSpeed = (bytesPerSec: number): string => {
-  return `${formattedSize(bytesPerSec)}/s`;
-};
+const { progress, setupListeners, clearProgress, cleanup } = useProgress();
 
-const formatEta = (seconds: number): string => {
-  if (seconds <= 0 || !isFinite(seconds)) return "--";
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  if (h > 0) return `${h}h ${m}m ${s}s`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
-};
+const canCancel = computed(() => isRunning.value);
 
-const progressPercent = computed(() => {
-  if (!progress.value) return 0;
-  return Math.min(progress.value.percent, 100).toFixed(1);
-});
-
-const canStart = computed(() => {
-  if (isRunning.value) return false;
-  if (mode.value === "clone") {
-    return selectedSourceDisk.value !== "" && outputImagePath.value !== "";
+async function checkElevation() {
+  try {
+    isAdmin.value = await isElevated();
+    showAdminWarning.value = !isAdmin.value;
+  } catch {
+    isAdmin.value = false;
+    showAdminWarning.value = true;
   }
-  if (mode.value === "restore") {
-    return inputImagePath.value !== "" && selectedTargetDisk.value !== "";
-  }
-  if (mode.value === "verify") {
-    return inputImagePath.value !== "";
-  }
-  return false;
-});
+}
 
 async function loadDisks() {
   loadingDisks.value = true;
   diskError.value = "";
   try {
-    const result = await invoke<DiskInfo[]>("list_disks");
+    const result = await listDisks();
     disks.value = result;
   } catch (e) {
     diskError.value = String(e);
@@ -93,93 +55,77 @@ async function loadDisks() {
   }
 }
 
-async function browseOutputImage() {
-  const path = await save({
-    defaultPath: "disk_image.img",
-    filters: [{ name: "Disk Image", extensions: ["img", "raw", "dd"] }],
-  });
-  if (path) {
-    outputImagePath.value = path;
-  }
-}
-
-async function browseInputImage() {
-  const path = await open({
-    multiple: false,
-    filters: [{ name: "Disk Image", extensions: ["img", "raw", "dd", "*"] }],
-  });
-  if (path && typeof path === "string") {
-    inputImagePath.value = path;
-  }
-}
-
-async function startOperation() {
-  progress.value = null;
+function handleStart(promise: Promise<unknown>) {
+  clearProgress();
   operationError.value = "";
   operationSuccess.value = "";
   hashResult.value = "";
   isRunning.value = true;
 
+  promise
+    .then(() => {
+      operationSuccess.value =
+        mode.value === "clone"
+          ? "Clone completed successfully!"
+          : mode.value === "restore"
+          ? "Restore completed successfully!"
+          : mode.value === "disk2disk"
+          ? "Disk-to-disk copy completed successfully!"
+          : "";
+    })
+    .catch((e) => {
+      operationError.value = String(e);
+    })
+    .finally(() => {
+      isRunning.value = false;
+    });
+}
+
+function handleHash(hash: string) {
+  hashResult.value = hash;
+  operationSuccess.value = `SHA-256: ${hash}`;
+}
+
+async function handleRestartAsAdmin() {
   try {
-    if (mode.value === "clone") {
-      const disk = disks.value.find((d) => d.DeviceID === selectedSourceDisk.value);
-      if (!disk) throw new Error("No disk selected");
-      await invoke("start_clone", {
-        sourcePath: selectedSourceDisk.value,
-        outputPath: outputImagePath.value,
-        totalSize: disk.Size,
-        verify: verify.value,
-      });
-      operationSuccess.value = "Clone completed successfully!";
-    } else if (mode.value === "restore") {
-      await invoke("start_restore", {
-        imagePath: inputImagePath.value,
-        targetPath: selectedTargetDisk.value,
-      });
-      operationSuccess.value = "Restore completed successfully!";
-    } else if (mode.value === "verify") {
-      const hash = await invoke<string>("start_verify", {
-        imagePath: inputImagePath.value,
-      });
-      hashResult.value = hash;
-      operationSuccess.value = `SHA-256: ${hash}`;
-    }
+    await restartAsAdmin();
   } catch (e) {
-    operationError.value = String(e);
-  } finally {
-    isRunning.value = false;
+    diskError.value = String(e);
   }
 }
 
-async function cancelOperation() {
+async function handleCancel() {
   try {
-    await invoke("cancel_operation");
+    await cancelOperation();
     operationError.value = "Operation cancelled";
   } catch (e) {
     console.error("Cancel error:", e);
   }
 }
 
-function resetOperation() {
-  progress.value = null;
+function resetAllPanels() {
+  clearProgress();
   operationError.value = "";
   operationSuccess.value = "";
   hashResult.value = "";
+  clonePanelRef.value?.reset();
+  restorePanelRef.value?.reset();
+  diskToDiskPanelRef.value?.reset();
+  verifyPanelRef.value?.reset();
 }
 
-loadDisks();
+watch(mode, () => {
+  resetAllPanels();
+});
 
-listen<ProgressEvent>("clone-progress", (event) => {
-  progress.value = event.payload;
+onMounted(() => {
+  checkElevation();
+  loadDisks();
+  setupListeners();
 });
-listen<ProgressEvent>("restore-progress", (event) => {
-  progress.value = event.payload;
-});
-listen<ProgressEvent>("hash-progress", (event) => {
-  progress.value = event.payload;
-});
-listen<ProgressEvent>("verify-progress", (event) => {
-  progress.value = event.payload;
+
+onUnmounted(() => {
+  cleanup();
 });
 </script>
 
@@ -197,196 +143,69 @@ listen<ProgressEvent>("verify-progress", (event) => {
       <span class="subtitle">Disk Cloner</span>
     </header>
 
-    <div class="tabs">
-      <button
-        :class="['tab', mode === 'clone' ? 'tab-active' : '']"
-        @click="mode = 'clone'; resetOperation()"
-      >
-        Clone to Image
-      </button>
-      <button
-        :class="['tab', mode === 'restore' ? 'tab-active' : '']"
-        @click="mode = 'restore'; resetOperation()"
-      >
-        Restore from Image
-      </button>
-      <button
-        :class="['tab', mode === 'verify' ? 'tab-active' : '']"
-        @click="mode = 'verify'; resetOperation()"
-      >
-        Verify Image
-      </button>
-    </div>
+    <TabBar v-model="mode" />
 
     <div class="content">
-      <!-- CLONE MODE -->
-      <template v-if="mode === 'clone'">
-        <div class="section">
-          <h2>Source Disk</h2>
-          <div class="disk-list" v-if="disks.length > 0">
-            <label
-              v-for="disk in disks"
-              :key="disk.DeviceID"
-              :class="['disk-item', selectedSourceDisk === disk.DeviceID ? 'disk-selected' : '']"
-            >
-              <input
-                type="radio"
-                :value="disk.DeviceID"
-                v-model="selectedSourceDisk"
-                :disabled="isRunning"
-              />
-              <div class="disk-info">
-                <span class="disk-name">{{ disk.Caption }}</span>
-                <span class="disk-details">
-                  {{ formattedSize(disk.Size) }} ·
-                  {{ disk.MediaType || 'Unknown type' }} ·
-                  {{ disk.Partitions }} partition{{ disk.Partitions !== 1 ? 's' : '' }}
-                </span>
-                <span class="disk-path">{{ disk.DeviceID }}</span>
-              </div>
-            </label>
-          </div>
-          <div v-else-if="diskError" class="error">{{ diskError }}</div>
-          <div v-else class="empty">No disks found</div>
-          <button class="btn btn-secondary" @click="loadDisks" :disabled="loadingDisks">
-            {{ loadingDisks ? "Loading..." : "Refresh Disks" }}
-          </button>
-        </div>
-
-        <div class="section">
-          <h2>Output Image</h2>
-          <div class="path-row">
-            <input
-              type="text"
-              v-model="outputImagePath"
-              placeholder="Path to save the disk image..."
-              :disabled="isRunning"
-              class="path-input"
-            />
-            <button class="btn btn-secondary" @click="browseOutputImage" :disabled="isRunning">Browse</button>
-          </div>
-          <label class="checkbox-label">
-            <input type="checkbox" v-model="verify" :disabled="isRunning" />
-            Verify with SHA-256 after clone
-          </label>
-        </div>
-      </template>
-
-      <!-- RESTORE MODE -->
-      <template v-if="mode === 'restore'">
-        <div class="section">
-          <h2>Source Image</h2>
-          <div class="path-row">
-            <input
-              type="text"
-              v-model="inputImagePath"
-              placeholder="Path to the disk image file..."
-              :disabled="isRunning"
-              class="path-input"
-            />
-            <button class="btn btn-secondary" @click="browseInputImage" :disabled="isRunning">Browse</button>
-          </div>
-        </div>
-
-        <div class="section">
-          <h2>Target Disk</h2>
-          <div class="warning-box">
-            WARNING: All data on the selected disk will be PERMANENTLY destroyed!
-          </div>
-          <div class="disk-list" v-if="disks.length > 0">
-            <label
-              v-for="disk in disks"
-              :key="disk.DeviceID"
-              :class="['disk-item', selectedTargetDisk === disk.DeviceID ? 'disk-selected' : '']"
-            >
-              <input
-                type="radio"
-                :value="disk.DeviceID"
-                v-model="selectedTargetDisk"
-                :disabled="isRunning"
-              />
-              <div class="disk-info">
-                <span class="disk-name">{{ disk.Caption }}</span>
-                <span class="disk-details">
-                  {{ formattedSize(disk.Size) }} ·
-                  {{ disk.MediaType || 'Unknown type' }} ·
-                  {{ disk.Partitions }} partition{{ disk.Partitions !== 1 ? 's' : '' }}
-                </span>
-                <span class="disk-path">{{ disk.DeviceID }}</span>
-              </div>
-            </label>
-          </div>
-          <div v-else-if="diskError" class="error">{{ diskError }}</div>
-          <div v-else class="empty">No disks found</div>
-          <button class="btn btn-secondary" @click="loadDisks" :disabled="loadingDisks">
-            {{ loadingDisks ? "Loading..." : "Refresh Disks" }}
-          </button>
-        </div>
-      </template>
-
-      <!-- VERIFY MODE -->
-      <template v-if="mode === 'verify'">
-        <div class="section">
-          <h2>Verify Image</h2>
-          <p class="description">Compute the SHA-256 hash of a disk image file.</p>
-          <div class="path-row">
-            <input
-              type="text"
-              v-model="inputImagePath"
-              placeholder="Path to the disk image file..."
-              :disabled="isRunning"
-              class="path-input"
-            />
-            <button class="btn btn-secondary" @click="browseInputImage" :disabled="isRunning">Browse</button>
-          </div>
-          <div v-if="hashResult" class="hash-result">
-            <strong>SHA-256:</strong>
-            <code>{{ hashResult }}</code>
-          </div>
-        </div>
-      </template>
-
-      <!-- PROGRESS -->
-      <div v-if="isRunning || progress" class="section progress-section">
-        <h2>Progress</h2>
-        <div class="progress-bar-container">
-          <div class="progress-bar" :style="{ width: progressPercent + '%' }"></div>
-        </div>
-        <div class="progress-stats">
-          <span>{{ progressPercent }}%</span>
-          <span v-if="progress">
-            {{ formattedSize(progress.bytes_processed) }} / {{ formattedSize(progress.total_bytes) }}
-          </span>
-          <span v-if="progress && progress.speed_bytes_per_sec > 0">
-            {{ formatSpeed(progress.speed_bytes_per_sec) }}
-          </span>
-          <span v-if="progress && progress.eta_seconds > 0">
-            ETA: {{ formatEta(progress.eta_seconds) }}
-          </span>
-        </div>
+      <div v-if="showAdminWarning" class="admin-warning">
+        <strong>Administrator privileges required</strong>
+        <p>
+          Physical disk access is restricted on this system.
+          Please close CloneTool and restart it as Administrator
+          (right-click the executable → "Run as administrator").
+        </p>
+        <button class="btn btn-primary admin-btn" @click="handleRestartAsAdmin">
+          Restart as Administrator
+        </button>
       </div>
 
-      <!-- RESULT MESSAGES -->
+      <button class="btn btn-secondary refresh-btn" @click="loadDisks" :disabled="loadingDisks">
+        {{ loadingDisks ? "Loading..." : "Refresh Disks" }}
+      </button>
+
+      <div v-if="diskError" class="error">{{ diskError }}</div>
+      <div v-else-if="!loadingDisks && disks.length === 0 && !showAdminWarning" class="empty">
+        No physical disks found. Click "Refresh Disks" to try again.
+      </div>
+
+      <ClonePanel
+        v-if="mode === 'clone'"
+        ref="clonePanelRef"
+        :disks="disks"
+        :is-running="isRunning"
+        @start="handleStart"
+      />
+
+      <RestorePanel
+        v-if="mode === 'restore'"
+        ref="restorePanelRef"
+        :disks="disks"
+        :is-running="isRunning"
+        @start="handleStart"
+      />
+
+      <DiskToDiskPanel
+        v-if="mode === 'disk2disk'"
+        ref="diskToDiskPanelRef"
+        :disks="disks"
+        :is-running="isRunning"
+        @start="handleStart"
+      />
+
+      <VerifyPanel
+        v-if="mode === 'verify'"
+        ref="verifyPanelRef"
+        :is-running="isRunning"
+        @start="handleStart"
+        @hash="handleHash"
+      />
+
+      <ProgressDisplay v-if="isRunning || progress" :progress="progress" />
+
       <div v-if="operationSuccess && !isRunning" class="success">{{ operationSuccess }}</div>
       <div v-if="operationError && !isRunning" class="error">{{ operationError }}</div>
 
-      <!-- ACTION BUTTONS -->
-      <div class="actions">
-        <button
-          class="btn btn-primary"
-          @click="startOperation"
-          :disabled="!canStart"
-          v-if="!isRunning"
-        >
-          {{ mode === 'clone' ? 'Start Clone' : mode === 'restore' ? 'Start Restore' : 'Verify Image' }}
-        </button>
-        <button
-          class="btn btn-danger"
-          @click="cancelOperation"
-          v-if="isRunning"
-        >
-          Cancel
-        </button>
+      <div class="actions" v-if="canCancel">
+        <button class="btn btn-danger" @click="handleCancel">Cancel</button>
       </div>
     </div>
   </div>
@@ -461,42 +280,14 @@ body {
   font-weight: 500;
 }
 
-.tabs {
-  display: flex;
-  gap: 2px;
-  padding: 12px 24px 0;
-  background: var(--bg-secondary);
-  border-bottom: 1px solid var(--border);
-}
-
-.tab {
-  padding: 10px 20px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  background: transparent;
-  border: none;
-  border-bottom: 2px solid transparent;
-  cursor: pointer;
-  transition: all 0.2s;
-  font-family: inherit;
-}
-
-.tab:hover {
-  color: var(--text-primary);
-  background: var(--bg-tertiary);
-}
-
-.tab-active {
-  color: var(--accent);
-  border-bottom-color: var(--accent);
-  background: var(--accent-bg);
-}
-
 .content {
   flex: 1;
   padding: 20px 24px;
   overflow-y: auto;
+}
+
+.refresh-btn {
+  margin-bottom: 16px;
 }
 
 .section {
@@ -541,6 +332,11 @@ body {
   border-color: var(--accent) !important;
 }
 
+.disk-conflict {
+  border-color: var(--danger) !important;
+  background: var(--danger-bg) !important;
+}
+
 .disk-item input[type="radio"] {
   margin-top: 3px;
   accent-color: var(--accent);
@@ -557,6 +353,12 @@ body {
   font-size: 14px;
   font-weight: 600;
   color: var(--text-primary);
+}
+
+.drive-letters {
+  font-weight: 500;
+  color: var(--accent);
+  margin-left: 4px;
 }
 
 .disk-details {
@@ -666,38 +468,6 @@ body {
   background: #d9364e;
 }
 
-.progress-section {
-  background: var(--bg-secondary);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 16px;
-}
-
-.progress-bar-container {
-  width: 100%;
-  height: 8px;
-  background: var(--bg-tertiary);
-  border-radius: 4px;
-  overflow: hidden;
-  margin-bottom: 10px;
-}
-
-.progress-bar {
-  height: 100%;
-  background: linear-gradient(90deg, var(--accent), var(--accent-hover));
-  border-radius: 4px;
-  transition: width 0.3s ease;
-}
-
-.progress-stats {
-  display: flex;
-  justify-content: space-between;
-  font-size: 12px;
-  color: var(--text-secondary);
-  gap: 16px;
-  flex-wrap: wrap;
-}
-
 .success {
   padding: 12px 14px;
   background: var(--success-bg);
@@ -734,6 +504,12 @@ body {
   margin-bottom: 12px;
 }
 
+.field-error {
+  font-size: 12px;
+  color: var(--danger);
+  margin-top: 4px;
+}
+
 .hash-result {
   margin-top: 12px;
   padding: 12px;
@@ -759,5 +535,31 @@ body {
   display: flex;
   gap: 10px;
   margin-top: 8px;
+}
+
+.admin-warning {
+  padding: 14px 16px;
+  background: var(--warning-bg);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-sm);
+  margin-bottom: 16px;
+}
+
+.admin-warning strong {
+  display: block;
+  color: var(--warning);
+  font-size: 14px;
+  margin-bottom: 6px;
+}
+
+.admin-warning p {
+  color: var(--text-secondary);
+  font-size: 13px;
+  margin: 0 0 10px 0;
+  line-height: 1.5;
+}
+
+.admin-btn {
+  margin-top: 4px;
 }
 </style>

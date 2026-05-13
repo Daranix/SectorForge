@@ -1,7 +1,6 @@
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::windows::fs::OpenOptionsExt;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
@@ -9,8 +8,31 @@ use tauri::{AppHandle, Emitter};
 const CHUNK_SIZE: usize = 1024 * 1024;
 const PROGRESS_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::fs::OpenOptionsExt;
+
+#[cfg(target_os = "windows")]
 const FILE_SHARE_READ: u32 = 0x00000001;
+#[cfg(target_os = "windows")]
 const FILE_SHARE_WRITE: u32 = 0x00000002;
+
+/// Open a raw device path for reading (cross-platform)
+fn open_device_read(path: &str) -> std::io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(target_os = "windows")]
+    opts.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    opts.open(path)
+}
+
+/// Open a raw device path for writing (cross-platform)
+fn open_device_write(path: &str) -> std::io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true);
+    #[cfg(target_os = "windows")]
+    opts.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    opts.open(path)
+}
 
 #[derive(serde::Serialize, Clone)]
 pub struct ProgressEvent {
@@ -59,17 +81,13 @@ pub fn clone_disk_to_image(
     cancel_flag: &std::sync::atomic::AtomicBool,
     verify: bool,
 ) -> Result<(), String> {
-    let mut source = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .open(source_path)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                format!("Permission denied opening '{}'. Run as Administrator.", source_path)
-            } else {
-                format!("Failed to open source disk '{}': {}", source_path, e)
-            }
-        })?;
+    let mut source = open_device_read(source_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            format!("Permission denied opening '{}'. Run as Administrator.", source_path)
+        } else {
+            format!("Failed to open source disk '{}': {}", source_path, e)
+        }
+    })?;
 
     let mut output = File::create(output_path)
         .map_err(|e| format!("Failed to create image file '{}': {}", output_path, e))?;
@@ -157,17 +175,13 @@ pub fn restore_image_to_disk(
     let mut image = File::open(image_path)
         .map_err(|e| format!("Failed to open image file '{}': {}", image_path, e))?;
 
-    let mut target = std::fs::OpenOptions::new()
-        .write(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .open(target_path)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                format!("Permission denied opening '{}'. Run as Administrator.", target_path)
-            } else {
-                format!("Failed to open target disk '{}': {}", target_path, e)
-            }
-        })?;
+    let mut target = open_device_write(target_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            format!("Permission denied opening '{}'. Run as Administrator.", target_path)
+        } else {
+            format!("Failed to open target disk '{}': {}", target_path, e)
+        }
+    })?;
 
     let mut buffer = vec![0u8; CHUNK_SIZE];
     let mut bytes_written: u64 = 0;
@@ -332,29 +346,21 @@ pub fn disk_to_disk(
         return Err("Source and target disks must be different".to_string());
     }
 
-    let mut source = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .open(source_path)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                format!("Permission denied opening '{}'. Run as Administrator.", source_path)
-            } else {
-                format!("Failed to open source disk '{}': {}", source_path, e)
-            }
-        })?;
+    let mut source = open_device_read(source_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            format!("Permission denied opening '{}'. Run as Administrator.", source_path)
+        } else {
+            format!("Failed to open source disk '{}': {}", source_path, e)
+        }
+    })?;
 
-    let mut target = std::fs::OpenOptions::new()
-        .write(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .open(target_path)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                format!("Permission denied opening '{}'. Run as Administrator.", target_path)
-            } else {
-                format!("Failed to open target disk '{}': {}", target_path, e)
-            }
-        })?;
+    let mut target = open_device_write(target_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            format!("Permission denied opening '{}'. Run as Administrator.", target_path)
+        } else {
+            format!("Failed to open target disk '{}': {}", target_path, e)
+        }
+    })?;
 
     let mut buffer = vec![0u8; CHUNK_SIZE];
     let mut bytes_copied: u64 = 0;
@@ -414,10 +420,7 @@ pub fn disk_to_disk(
             "source": source_path,
         }));
 
-        let mut verify_file = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(target_path)
+        let mut verify_file = open_device_read(target_path)
             .map_err(|e| format!("Failed to open target disk for verification: {}", e))?;
 
         let mut verify_hasher = Sha256::new();

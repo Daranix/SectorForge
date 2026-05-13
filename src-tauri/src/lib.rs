@@ -188,6 +188,74 @@ fn is_operation_running(state: tauri::State<'_, AppState>) -> bool {
     state.is_running.load(Ordering::SeqCst)
 }
 
+#[tauri::command]
+fn is_elevated() -> bool {
+    disk::is_elevated()
+}
+
+#[tauri::command]
+fn restart_as_admin(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::c_void;
+        use std::os::windows::ffi::OsStrExt;
+
+        const SW_SHOWNORMAL: i32 = 1;
+
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut c_void,
+                lpOperation: *const u16,
+                lpFile: *const u16,
+                lpParameters: *const u16,
+                lpDirectory: *const u16,
+                nShowCmd: i32,
+            ) -> *mut c_void;
+        }
+
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("Failed to get executable path: {}", e))?;
+
+        let exe_wide: Vec<u16> = std::ffi::OsStr::new(exe.as_os_str())
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let operation: Vec<u16> = std::ffi::OsStr::new("runas")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        unsafe {
+            let result = ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                exe_wide.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            );
+
+            // ShellExecuteW returns a handle > 32 on success, <= 32 on error
+            if result as usize <= 32 {
+                return Err(format!(
+                    "Failed to restart as administrator (error code: {})",
+                    result as usize
+                ));
+            }
+        }
+
+        // Exit current process after launching elevated one
+        app.exit(0);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Restart as administrator is only supported on Windows.".to_string())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -203,7 +271,19 @@ pub fn run() {
             start_disk_to_disk,
             cancel_operation,
             is_operation_running,
+            is_elevated,
+            restart_as_admin,
         ])
+        .setup(|app| {
+            #[cfg(debug_assertions)]
+            {
+                use tauri::Manager;
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.open_devtools();
+                }
+            }
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
