@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import type { OperationMode } from "@/types/disk";
 
-defineProps<{
+const props = defineProps<{
   modelValue: OperationMode;
+  disabled?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -17,6 +18,7 @@ const tabs: { key: OperationMode; label: string }[] = [
 ];
 
 function selectTab(mode: OperationMode) {
+  if (props.disabled) return;
   emit("update:modelValue", mode);
 }
 </script>
@@ -26,8 +28,9 @@ function selectTab(mode: OperationMode) {
     <button
       v-for="tab in tabs"
       :key="tab.key"
-      :class="['tab', modelValue === tab.key ? 'tab-active' : '']"
+      :class="['tab', modelValue === tab.key ? 'tab-active' : '', disabled ? 'tab-disabled' : '']"
       @click="selectTab(tab.key)"
+      :disabled="disabled"
     >
       {{ tab.label }}
     </button>
@@ -65,5 +68,11 @@ function selectTab(mode: OperationMode) {
   color: var(--accent);
   border-bottom-color: var(--accent);
   background: var(--accent-bg);
+}
+
+.tab-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  pointer-events: none;
 }
 </style>

@@ -190,7 +190,7 @@ pub fn list_physical_disks() -> Result<Vec<DiskInfo>, String> {
         if has_access_denied {
             return Err(
                 "Access denied when reading physical disks. \
-Please run CloneTool as Administrator (right-click → Run as administrator)."
+Please run SectorForge as Administrator (right-click → Run as administrator)."
                     .to_string(),
             );
         }
